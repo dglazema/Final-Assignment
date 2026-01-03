@@ -1,0 +1,454 @@
+---
+title: "Final Assignment"
+author: "Daphne Glazema - s4843037"
+date: "2025-12-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+needed <- c("cntry","e1","f15","e12","e13","e14","e16","e19","e20","e21","e22","e23","e24","e25","e26","e27","e28")
+needed[!needed %in% names(dat)]
+
+names(dat) <- tolower(names(dat))
+
+
+#Packages
+install.packages(c("readr","dplyr","tidyr","mgm","qgraph"), dependencies = TRUE)
+
+library(readr)
+library(dplyr)
+library(tidyr)
+library(mgm)
+library(qgraph)
+
+dat <- read_csv(file.choose(), show_col_types = FALSE)
+names(dat) <- tolower(names(dat))
+
+de <- dat %>%
+  mutate(cntry = trimws(cntry)) %>%
+  filter(cntry == "DE")
+
+##Define variables
+
+nodes_raw <- c(
+  "trmdcnt","trwkcnt","trplcnt",      # fairness: medical/work/police (3-category)
+  "eqpolbg",                          # equal political leadership good/bad (0-6)
+  "eqparep","eqparlv","freinsw","fineqpy",  # policies (1-5)
+  "wsekpwr","weasoff","wlespdm","wexashr","wprtbym","wbrgwrm" # stereotypes/backlash (1-5)
+)
+
+needed_cols <- c("cntry","gndr","eisced", nodes_raw)
+missing_cols <- needed_cols[!needed_cols %in% names(de)]
+if (length(missing_cols) > 0) {
+  stop(paste("These variables are missing from your dataset:", paste(missing_cols, collapse = ", ")))
+}
+
+de <- de %>%
+  mutate(
+    gender = ifelse(gndr %in% c(1,2), gndr, NA_real_),
+    gender = factor(gender, levels = c(1,2), labels = c("Men","Women"))
+  ) %>%
+  filter(!is.na(gender))
+
+
+# Clean data
+de2 <- de %>%
+  mutate(across(all_of(nodes_raw), ~na_if(., 7))) %>%
+  mutate(across(all_of(nodes_raw), ~na_if(., 8))) %>%
+  mutate(across(all_of(nodes_raw), ~na_if(., 9)))
+
+
+rev_1_5 <- function(x) ifelse(is.na(x), NA, 6 - x)
+
+de2 <- de2 %>%
+  mutate(
+    # Policy items: reverse (1 favour -> 5 against)
+    eqparep = rev_1_5(eqparep),
+    eqparlv = rev_1_5(eqparlv),
+    freinsw = rev_1_5(freinsw),
+    fineqpy = rev_1_5(fineqpy),
+    
+    # Backlash items: reverse (higher = less backlash)
+    wsekpwr = rev_1_5(wsekpwr),
+    weasoff = rev_1_5(weasoff),
+    wexashr = rev_1_5(wexashr),
+    wprtbym = rev_1_5(wprtbym),
+    wbrgwrm = rev_1_5(wbrgwrm),
+    
+    # eqpolbg: 0–6 already in right direction; shift to 1–7 for mgm categories
+    eqpolbg_shift = ifelse(is.na(eqpolbg), NA, eqpolbg + 1)
+  )
+
+#Fix: Collapse rare categories in wlespdm 
+collapse_5_to_3 <- function(x) {
+  case_when(
+    is.na(x) ~ NA_real_,
+    x %in% c(1, 2) ~ 1,
+    x == 3 ~ 2,
+    x %in% c(4, 5) ~ 3
+  )
+}
+
+de2 <- de2 %>%
+  mutate(wlespdm = collapse_5_to_3(wlespdm))
+
+# Final node list for MGM 
+nodes_mgm <- c(
+  "trmdcnt","trwkcnt","trplcnt",
+  "eqpolbg_shift",
+  "eqparep","eqparlv","freinsw","fineqpy",
+  "wsekpwr","weasoff","wlespdm","wexashr","wprtbym","wbrgwrm"
+)
+
+#MGM settings (categorical)
+type_vec <- rep("c", length(nodes_mgm))
+
+levs <- c(
+  trmdcnt = 3, trwkcnt = 3, trplcnt = 3,     # 1-3
+  eqpolbg_shift = 7,                         # 1-7
+  eqparep = 5, eqparlv = 5, freinsw = 5, fineqpy = 5,  # 1-5
+  wsekpwr = 5, weasoff = 5,
+  wlespdm = 3,                               # <-- collapsed to 3
+  wexashr = 5, wprtbym = 5, wbrgwrm = 5
+)
+
+#estimate MGM 
+estimate_mgm <- function(df, label = "subset") {
+  X <- df %>%
+    select(all_of(nodes_mgm)) %>%
+    drop_na() %>%
+    as.matrix()
+  
+  cat("\nFitting MGM for:", label,
+      "\nComplete cases used:", nrow(X), "\n")
+  
+  mgm(
+    data = X,
+    type = type_vec,
+    level = as.numeric(levs[nodes_mgm]),
+    k = 2,
+    lambdaSel = "EBIC",
+    lambdaGam = 0.25
+  )
+}
+
+#Missingness check 
+de2 %>%
+  summarise(
+    N_total = n(),
+    N_complete = sum(complete.cases(across(all_of(nodes_mgm))))
+  ) %>% print()
+
+#Fit networks and plot
+
+#Overall Germany network
+fit_all <- estimate_mgm(de2, "Germany (DE) – Overall")
+W_all <- fit_all$pairwise$wadj
+
+#Men vs Women
+fit_men <- estimate_mgm(de2 %>% filter(gender == "Men"), "Germany – Men")
+fit_women <- estimate_mgm(de2 %>% filter(gender == "Women"), "Germany – Women")
+
+W_men <- fit_men$pairwise$wadj
+W_women <- fit_women$pairwise$wadj
+
+#Plots 
+
+library(qgraph)
+
+# 1) Node order (MUST match your MGM estimation order)
+nodes_mgm <- c(
+  "trmdcnt","trwkcnt","trplcnt",
+  "eqpolbg_shift",
+  "eqparep","eqparlv","freinsw","fineqpy",
+  "wsekpwr","weasoff","wlespdm","wexashr","wprtbym","wbrgwrm"
+)
+
+# 2) Number labels for nodes
+node_nums <- as.character(seq_along(nodes_mgm))
+
+# 3) Concise item text for legend (no answer categories)
+full_labels <- c(
+  "Medical treatment fairness (women vs men)",
+  "Workplace fairness (hiring/pay/promotion)",
+  "Police treatmentfairness (women vs men)",
+  "Equal women/men in political leadership: good/bad",
+  "Equal seats in parliament (gender parity)",
+  "Equal parental leave requirement",
+  "Firing employees who insult women at work",
+  "Fining businesses for unequal pay",
+  "Women seek power by controlling men",
+  "Women get easily offended",
+  "Women paid less than men for same work",
+  "Women exaggerate sexual harassment claims",
+  "Women should be protected by men",
+  "Women have better sense of right/wrong than men"
+)
+
+# 4) Color groups (domains)
+group_names <- c(
+  "Fairness of Treatment",
+  "Equality policies",
+  "Female Stereotypes"
+)
+
+groups <- list(
+  "Fairness of Treatment" = which(nodes_mgm %in% c("trmdcnt","trwkcnt","trplcnt","wlespdm")),
+  "Equality policies"     = which(nodes_mgm %in% c("eqpolbg_shift","eqparep","eqparlv","freinsw","fineqpy")),
+  "Female Stereotypes"= which(nodes_mgm %in% c("wsekpwr","weasoff","wexashr","wprtbym","wbrgwrm"))
+)
+
+group_colors <- c("steelblue3", "darkorange2", "seagreen4")
+names(group_colors) <- group_names
+
+# 5) Plot function: network left, legends right
+plot_network_numbered <- function(W, main_title, layout_mat = NULL, cex_legend = 0.9) {
+  op <- par(no.readonly = TRUE)
+  on.exit(par(op), add = TRUE)
+  
+  layout(matrix(c(1,2), nrow = 1), widths = c(2.2, 1.6))
+  par(mar = c(4, 4, 4, 1))
+  
+  qgraph(
+    W,
+    layout = if (is.null(layout_mat)) "spring" else layout_mat,
+    labels = node_nums,
+    groups = groups,
+    color  = group_colors,
+    legend = FALSE,
+    title  = main_title,
+    vsize  = 8,
+    label.cex = 1.0
+  )
+  
+  # right panel: legends
+  par(mar = c(1, 1, 4, 1))
+  plot.new()
+  title("Legend", line = 1)
+  
+  legend(
+    "topleft",
+    legend = group_names,
+    pch = 19,
+    col = group_colors,
+    pt.cex = 1.4,
+    bty = "n",
+    cex = 0.95
+  )
+  
+  y <- 0.75
+  text(0.02, y, "Node numbers:", adj = 0, cex = 0.95, font = 2)
+  y <- y - 0.05
+  
+  for (i in seq_along(full_labels)) {
+    text(0.02, y, paste0(i, ": ", full_labels[i]), adj = 0, cex = cex_legend)
+    y <- y - 0.045
+  }
+}
+
+# 6) Use a fixed layout so plots are comparable
+layout_fixed <- qgraph(W_all, layout = "spring", DoNotPlot = TRUE)$layout
+
+# 7) Plot the 3 networks (swap W_men/W_women for W_low/W_high if you prefer)
+plot_network_numbered(W_all,   "ESS11 Germany (DE): Overall", layout_mat = layout_fixed)
+plot_network_numbered(W_men,   "ESS11 Germany (DE): Men",     layout_mat = layout_fixed)
+plot_network_numbered(W_women, "ESS11 Germany (DE): Women",   layout_mat = layout_fixed)
+
+
+#Diagnostics#
+
+#tune selection + prediction chekcs
+
+fit_mgm_gamma <- function(df, gamma, label="") {
+  X <- df %>% select(all_of(nodes_mgm)) %>% drop_na() %>% as.matrix()
+  fit <- mgm(
+    data = X,
+    type = type_vec,
+    level = as.numeric(levs[nodes_mgm]),
+    k = 2,
+    lambdaSel = "EBIC",
+    lambdaGam = gamma
+  )
+  W <- fit$pairwise$wadj
+  list(fit=fit, W=W, n=nrow(X), gamma=gamma, label=label)
+}
+
+gammas <- c(0, 0.25, 0.5)
+fits_all_gamma <- lapply(gammas, \(g) fit_mgm_gamma(de2, g, paste0("All, gamma=", g)))
+
+# Compare how many edges survive:
+edge_count <- sapply(fits_all_gamma, \(obj) sum(obj$W != 0)/2)
+names(edge_count) <- paste0("gamma=", gammas)
+edge_count
+
+# Correlate edge weights across gamma values (stability of structure)
+vecW <- function(W) W[upper.tri(W)]
+cor(vecW(fits_all_gamma[[1]]$W), vecW(fits_all_gamma[[2]]$W))
+cor(vecW(fits_all_gamma[[2]]$W), vecW(fits_all_gamma[[3]]$W))
+
+#bootstrap s
+
+library(bootnet)
+
+X_all <- de2 %>% select(all_of(nodes_mgm)) %>% drop_na()
+
+set.seed(1)
+boot_all <- bootnet(
+  net_all,
+  nBoots = 200,
+  type = "nonparametric",
+  statistics = "edge"
+)
+plot(boot_all, labels = FALSE, order = "sample")
+
+#Desntiy of overall network
+
+density_stats <- function(W) {
+  p <- ncol(W)
+  possible <- p * (p - 1) / 2
+  nz <- sum(W[upper.tri(W)] != 0)
+  edge_density <- nz / possible
+  
+  mean_abs_allpairs <- mean(abs(W[upper.tri(W)]))
+  mean_abs_nonzero  <- if (nz > 0) mean(abs(W[upper.tri(W)][W[upper.tri(W)] != 0])) else NA_real_
+  
+  data.frame(
+    nodes = p,
+    possible_edges = possible,
+    nonzero_edges = nz,
+    edge_density = edge_density,
+    mean_abs_weight_allpairs = mean_abs_allpairs,
+    mean_abs_weight_nonzero = mean_abs_nonzero
+  )
+}
+
+dens_all   <- density_stats(W_all)
+dens_men   <- density_stats(W_men)
+dens_women <- density_stats(W_women)
+
+rbind(
+  cbind(network="Overall", dens_all),
+  cbind(network="Men", dens_men),
+  cbind(network="Women", dens_women)
+)
+
+#domain specific connectivity:
+
+group_idx <- groups  # your existing list: fairness/policies/stereotypes
+
+sum_abs_edges_between <- function(W, idxA, idxB) {
+  M <- abs(W[idxA, idxB, drop = FALSE])
+  sum(M[M != 0])
+}
+
+count_edges_between <- function(W, idxA, idxB) {
+  M <- W[idxA, idxB, drop = FALSE]
+  sum(M != 0)
+}
+
+domain_connectivity <- function(W, groups_list) {
+  gnames <- names(groups_list)
+  out <- expand.grid(A = gnames, B = gnames, stringsAsFactors = FALSE)
+  out$nonzero_edges <- NA_integer_
+  out$sum_abs_weight <- NA_real_
+  
+  for (i in seq_len(nrow(out))) {
+    A <- out$A[i]; B <- out$B[i]
+    idxA <- groups_list[[A]]
+    idxB <- groups_list[[B]]
+    
+    if (A == B) {
+      # within-domain: use upper triangle only
+      subW <- W[idxA, idxA, drop = FALSE]
+      out$nonzero_edges[i] <- sum(subW[upper.tri(subW)] != 0)
+      out$sum_abs_weight[i] <- sum(abs(subW[upper.tri(subW)])[abs(subW[upper.tri(subW)]) != 0])
+    } else {
+      # between-domain: full block (counts each cross edge once)
+      out$nonzero_edges[i] <- count_edges_between(W, idxA, idxB)
+      out$sum_abs_weight[i] <- sum_abs_edges_between(W, idxA, idxB)
+    }
+  }
+  out
+}
+
+dc_all   <- domain_connectivity(W_all, groups)
+dc_men   <- domain_connectivity(W_men, groups)
+dc_women <- domain_connectivity(W_women, groups)
+
+dc_all
+
+#bridge edges
+
+top_bridge_edges <- function(W, groups_list, node_names, top_n = 10) {
+  gnames <- names(groups_list)
+  res <- data.frame()
+  
+  for (i in 1:(length(gnames)-1)) {
+    for (j in (i+1):length(gnames)) {
+      A <- gnames[i]; B <- gnames[j]
+      idxA <- groups_list[[A]]
+      idxB <- groups_list[[B]]
+      block <- W[idxA, idxB, drop = FALSE]
+      
+      if (all(block == 0)) next
+      
+      # collect edges
+      for (a in seq_along(idxA)) {
+        for (b in seq_along(idxB)) {
+          w <- block[a, b]
+          if (w != 0) {
+            res <- rbind(res, data.frame(
+              domainA = A, domainB = B,
+              nodeA = node_names[idxA[a]],
+              nodeB = node_names[idxB[b]],
+              weight = w,
+              abs_weight = abs(w)
+            ))
+          }
+        }
+      }
+    }
+  }
+  
+  res <- res[order(-res$abs_weight), ]
+  head(res, top_n)
+}
+
+bridge_all   <- top_bridge_edges(W_all, groups, nodes_mgm, top_n = 10)
+bridge_men   <- top_bridge_edges(W_men, groups, nodes_mgm, top_n = 10)
+bridge_women <- top_bridge_edges(W_women, groups, nodes_mgm, top_n = 10)
+
+bridge_all
+bridge_men
+bridge_women
+
+#louvain algorithm
+
+library(igraph)
+
+louvain_membership <- function(W, node_names) {
+  Wabs <- abs(W)
+  diag(Wabs) <- 0
+  g <- graph_from_adjacency_matrix(Wabs, mode = "undirected", weighted = TRUE, diag = FALSE)
+  
+  cl <- cluster_louvain(g, weights = E(g)$weight)
+  list(
+    modularity = modularity(cl),
+    membership = setNames(membership(cl), node_names),
+    sizes = sizes(cl)
+  )
+}
+
+lou_all   <- louvain_membership(W_all, nodes_mgm)
+lou_men   <- louvain_membership(W_men, nodes_mgm)
+lou_women <- louvain_membership(W_women, nodes_mgm)
+
+lou_all$modularity
+lou_all$sizes
+lou_all$membership
+
+```
+
+
+
+
